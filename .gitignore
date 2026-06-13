@@ -1,0 +1,15 @@
+# env
+bot/.env
+
+# ChromaDB
+bot/chroma_db/
+
+# 大檔案
+crawler/weights.h5
+
+# 測試用
+crawler/captcha.jpg
+
+# Python
+__pycache__/
+*.pyc
