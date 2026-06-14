@@ -69,3 +69,15 @@ def update_user_state(user_id, mode=None, sub_mode=None, temp_data=None):
     
     cursor.close()
     conn.close()
+    
+# ------------------ 記錄使用情況 ------------------
+def log_usage(user_id, platform, feature, status, error_msg=None):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO usage_log (user_id, platform, feature, status, error_msg) VALUES (%s, %s, %s, %s, %s)",
+        (user_id, platform, feature, status, error_msg)
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()

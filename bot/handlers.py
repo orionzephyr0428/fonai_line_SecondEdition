@@ -1,6 +1,6 @@
 from db import get_connection
 from message_builders import build_message, build_credit_flex_message
-from state_service import update_user_state
+from state_service import update_user_state, log_usage
 from config import CRAWLER_BASE_URL, REQUEST_TIMEOUT_CONNECT, REQUEST_TIMEOUT_READ
 from RAG import main as RAG
 import json
@@ -135,8 +135,8 @@ def handle_query(user_id, user_state, msg, platform):
             resp.raise_for_status()
             logger.info("呼叫成功")
         except requests.RequestException as e:
+            log_usage(user_id, platform.lower(), f"credit_{time_period}year", "failed", error_msg=str(e))
             err_text = "查詢失敗，請稍後再試。"
-            # err_text = f"查詢失敗，請稍後再試。錯誤：{str(e)}"
             if platform == "LINE":
                 return TextSendMessage(text=err_text)
             else:
@@ -148,12 +148,14 @@ def handle_query(user_id, user_state, msg, platform):
         # 判斷回傳結果
         if not response_data.get("success"):
             err_text = response_data.get("error", "查詢失敗，請稍後再試。")
+            log_usage(user_id, platform.lower(), f"credit_{time_period}year", "failed", error_msg=err_text)
             if platform == "LINE":
                 return TextSendMessage(text=err_text)
             else:
                 return {"messages": [{"type": "text", "content": err_text}]}
         
         # 使用 Flex Message 回傳積分結果
+        log_usage(user_id, platform.lower(), f"credit_{time_period}year", "success")
         if platform == "LINE":
             reply_message = build_credit_flex_message(response_data["data"], time_period)
             logger.info("回傳 Flex Message（altText: %s）", reply_message.alt_text)
@@ -212,8 +214,10 @@ def handle_AI(user_id, user_state, msg, platform):
         result = RAG(msg, user_id)
         if result['success']:
             text = result['answer']
+            log_usage(user_id, platform.lower(), "ai", "success")
         else:
             text = "這題超出我們資料庫範圍，我已幫您請教專員，取得答案就回覆您。"
+            log_usage(user_id, platform.lower(), "ai", "failed", error_msg=result.get("error", "RAG failed"))
         if platform == "LINE":
             reply_message = TextSendMessage(text=text)
         elif platform == "web":
@@ -335,6 +339,7 @@ def handle_faq(user_id, user_state, msg, platform):
                 reply_message = messages
 
         # 回到初始 FAQ 狀態
+        log_usage(user_id, platform.lower(), "faq", "success")
         update_user_state(user_id, mode="human", sub_mode=None, temp_data={})
         cursor.close()
         conn.close()
