@@ -5,10 +5,11 @@ import asyncio
 import aiohttp
 import CaptchaCracker as cc
 import re
+import tempfile
 import traceback
 import logging
 from flask_cors import CORS
-from datetime import datetime, timedelta
+from datetime import datetime
 from urllib.parse import urljoin
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s')
@@ -104,6 +105,7 @@ async def login(username, password, login_url, max_retry, browser):
         except Exception as e:
             last_exc = e
             last_trace = traceback.format_exc()
+            logger.warning(f"登入嘗試 {attempt}/{max_retry} 發生錯誤: {e}", exc_info=True)
         finally:
             if not success:
                 await page.close()
@@ -114,29 +116,35 @@ async def login(username, password, login_url, max_retry, browser):
 async def download_and_recognize_captcha(page, MODEL, max_attempts=3):
     captcha_elem = await page.wait_for_selector('#simpleCaptcha_image', state="visible", timeout=10000)
     captcha_url = await captcha_elem.get_attribute('src')
-    captcha_path = "captcha.jpg"
-
-    full_url = urljoin(page.url, captcha_url)
-    response = await page.request.get(full_url)
-    if response.status == 200:
-        image_bytes = await response.body()
-        with open("captcha.jpg", "wb") as f:
-            f.write(image_bytes)
-        logger.info("原始驗證碼下載成功")
-    else:
-        raise Exception("無法從伺服器獲取原始驗證碼圖片")
+    captcha_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    captcha_path = captcha_file.name
+    captcha_file.close()
 
     try:
-        captcha_code = MODEL.predict(captcha_path)
-        if len(captcha_code) == 6 and captcha_code.isalnum():
-            logger.info("驗證碼辨識成功")
-            return captcha_code
+        full_url = urljoin(page.url, captcha_url)
+        response = await page.request.get(full_url)
+        if response.status == 200:
+            image_bytes = await response.body()
+            with open(captcha_path, "wb") as f:
+                f.write(image_bytes)
+            logger.info("原始驗證碼下載成功")
         else:
-            logger.warning(f"驗證碼格式錯誤: '{captcha_code}'")
+            raise Exception("無法從伺服器獲取原始驗證碼圖片")
+
+        try:
+            captcha_code = MODEL.predict(captcha_path)
+            if len(captcha_code) == 6 and captcha_code.isalnum():
+                logger.info("驗證碼辨識成功")
+                return captcha_code
+            else:
+                logger.warning(f"驗證碼格式錯誤: '{captcha_code}'")
+                return None
+        except Exception as e:
+            logger.error(f"模型辨識失敗: {e}")
             return None
-    except Exception as e:
-        logger.error(f"模型辨識失敗: {e}")
-        return None
+    finally:
+        if os.path.exists(captcha_path):
+            os.remove(captcha_path)
 
 async def fill_and_submit_captcha(page, captcha_code):
     try:
@@ -170,38 +178,10 @@ async def extract_valid_period(page):
     return match.group(1), match.group(2)
 
 # ------------------ 日期計算（純 Python）------------------
-def calculate_date_range(valid_start_str, valid_end_str):
-    def parse_roc(s):
-        parts = s.split('/')
-        return datetime(int(parts[0]) + 1911, int(parts[1]), int(parts[2]))
-
-    def to_roc_str(d):
-        return f"{d.year - 1911}/{d.month:02d}/{d.day:02d}"
-
-    start_date = parse_roc(valid_start_str)
-    end_date = parse_roc(valid_end_str)
-
+def calculate_date_range():
     now = datetime.now()
-    start_month = start_date.month
-    start_day = start_date.day
-
-    this_year_anniversary = datetime(now.year, start_month, start_day)
-
-    if now < this_year_anniversary:
-        ideal_start = datetime(now.year - 1, start_month, start_day)
-    else:
-        ideal_start = this_year_anniversary
-
-    actual_query_start = max(ideal_start, start_date)
-
-    try:
-        actual_query_end = datetime(actual_query_start.year + 1, start_month, start_day) - timedelta(days=1)
-    except ValueError:
-        actual_query_end = datetime(actual_query_start.year + 1, 2, 28)
-
-    actual_query_end = min(actual_query_end, end_date)
-
-    return to_roc_str(actual_query_start), to_roc_str(actual_query_end)
+    roc_year = now.year - 1911
+    return f"{roc_year}/01/01", f"{roc_year}/12/31"
 
 # ------------------ 直接打 API ------------------
 async def fetch_all_scores(cookies, selected_op, cert_sdt, cert_edt):
@@ -218,16 +198,29 @@ async def fetch_all_scores(cookies, selected_op, cert_sdt, cert_edt):
         responses = await asyncio.gather(*tasks)
 
         results = {}
+        details = {}
         for t, resp in zip(SCORE_TYPES, responses):
             try:
-                data = await resp.json(content_type=None)
-                results[t] = str(data.get("score", 0))
+                raw = await resp.json(content_type=None)
+                score = str(raw.get("score", 0))
+                results[t] = score
+                details[t] = {
+                    "status": resp.status,
+                    "score": score,
+                    "raw": raw,
+                }
             except Exception as e:
                 logger.error(f"解析 {t} 失敗: {e}")
                 results[t] = "0"
+                details[t] = {
+                    "status": resp.status,
+                    "score": "0",
+                    "raw": None,
+                    "error": str(e),
+                }
 
     logger.info(f"fetch_all_scores 完成: {results}")
-    return results
+    return results, details
 
 # ------------------ 組資料 ------------------
 def build_data_list(valid_start, valid_end, cert_sdt, cert_edt, scores):
@@ -265,6 +258,10 @@ async def scrape_single(idno, brDt, time_range):
 
             selected_op = await page.eval_on_selector("#selectedOp", "el => el.value")
             valid_start, valid_end = await extract_valid_period(page)
+            if not valid_start or not valid_end:
+                await page.close()
+                return {"success": False, "error": "無法取得有效期間"}
+
             cookies = {c['name']: c['value'] for c in await page.context.cookies()}
 
             await page.close()
@@ -273,24 +270,46 @@ async def scrape_single(idno, brDt, time_range):
 
     # 計算查詢區間
     if time_range == 1:
-        cert_sdt, cert_edt = calculate_date_range(valid_start, valid_end)
+        cert_sdt, cert_edt = calculate_date_range()
     else:
         cert_sdt, cert_edt = valid_start, valid_end
+
+    before_fetch_scores = {
+        "selected_op": selected_op,
+        "valid_start": valid_start,
+        "valid_end": valid_end,
+        "cert_sdt": cert_sdt,
+        "cert_edt": cert_edt,
+        "time_range": time_range,
+        "cookies_count": len(cookies),
+    }
 
     logger.info(f"查詢區間: {cert_sdt} ~ {cert_edt}")
 
     # 同時打 19 個 API
-    scores = await fetch_all_scores(cookies, selected_op, cert_sdt, cert_edt)
+    scores, score_details = await fetch_all_scores(cookies, selected_op, cert_sdt, cert_edt)
     data = build_data_list(valid_start, valid_end, cert_sdt, cert_edt, scores)
 
-    return {"success": True, "data": data}
+    return {
+        "success": True,
+        "data": data,
+        "debug": {
+            "before_fetch_scores": before_fetch_scores,
+            "scores": scores,
+            "score_details": score_details,
+        },
+    }
 
 def main(idno, brDt, time_range):
     result = asyncio.run(scrape_single(idno, brDt, time_range))
     if not result.get("success"):
         return {"success": False, "error": result.get("error", "Unknown error")}
     logger.info(f"爬取完成，共 {len(result.get('data', []))} 筆")
-    return {"success": True, "data": result.get("data", [])}
+    return {
+        "success": True,
+        "data": result.get("data", []),
+        "debug": result.get("debug", {}),
+    }
 
 # ------------------ Flask API ------------------
 @app.route("/run_one_6year", methods=["POST"])
