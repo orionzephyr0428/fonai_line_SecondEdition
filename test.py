@@ -7,7 +7,7 @@ from pathlib import Path
 from urllib import error, request
 
 
-DEFAULT_BASE_URL = "http://127.0.0.1:6000"
+DEFAULT_BASE_URL = "https://bot.fonai.it.com/crawler"
 
 
 def safe_cell(data, row, col, default=""):
